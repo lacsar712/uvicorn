@@ -21,6 +21,12 @@ from uvicorn._types import (
 )
 from uvicorn.config import Config
 from uvicorn.logging import TRACE_LOG_LEVEL
+from uvicorn.policy import (
+    ConnHalfClose,
+    PolicySnapshot,
+    access_enabled,
+    protocol_error_access_enabled,
+)
 from uvicorn.protocols.http.flow_control import HIGH_WATER_LIMIT, FlowControl, service_unavailable
 from uvicorn.protocols.utils import get_client_addr, get_local_addr, get_path_with_query_string, get_remote_addr, is_ssl
 from uvicorn.server import ServerState
@@ -65,6 +71,7 @@ class ZttpH2Protocol(asyncio.Protocol):
         self.server_state = server_state
         self.connections = server_state.connections
         self.tasks = server_state.tasks
+        self.policy_stack = server_state.policy_stack
 
         # Per-connection state
         self.transport: asyncio.Transport = None  # type: ignore[assignment]
@@ -73,6 +80,10 @@ class ZttpH2Protocol(asyncio.Protocol):
         self.client: tuple[str, int] | None = None
         self.scheme: Literal["http", "https"] | None = None
         self.shutdown_requested = False
+        self._goaway_sent = False
+        # Streams whose response is done but whose request body is still being
+        # drained before a conn_half_close=teardown may close the connection.
+        self._draining: set[int] = set()
 
         # Per-stream state, keyed by HTTP/2 stream id
         self.cycles: dict[int, RequestResponseCycle] = {}
@@ -130,6 +141,7 @@ class ZttpH2Protocol(asyncio.Protocol):
         except zttp.RemoteProtocolError as exc:
             msg = "Invalid HTTP/2 frame received: %s"
             self.logger.warning(msg, exc)
+            self._log_protocol_error_access()
             self.flush()
             self.transport.close()
             return
@@ -176,6 +188,9 @@ class ZttpH2Protocol(asyncio.Protocol):
             elif isinstance(event, zttp.EndOfMessage):
                 cycle = self.cycles.get(event.stream_id)
                 if cycle is None or cycle.response_complete:
+                    # A stream being drained after its response completed.
+                    if event.stream_id in self._draining:
+                        self._stream_drained(event.stream_id)
                     continue
                 cycle.more_body = False
                 cycle.message_event.set()
@@ -183,7 +198,7 @@ class ZttpH2Protocol(asyncio.Protocol):
                 self.handle_rst_stream(event)
             elif isinstance(event, zttp.GoAway):
                 self.shutdown_requested = True
-                if not self.cycles:
+                if not self.cycles and not self._draining:
                     self._close_connection()
             # Settings, Ping and WindowUpdate need no action here: zttp tracks
             # the send windows internally, and `flush` writes whatever bytes
@@ -244,6 +259,8 @@ class ZttpH2Protocol(asyncio.Protocol):
             message_event=asyncio.Event(),
             on_response=self.on_response_complete,
             resume_reading=self.resume_reading_if_idle,
+            policy=self.policy_stack.snapshot(),
+            on_frame_close=self._request_frame_close,
         )
         self.cycles[event.stream_id] = cycle
 
@@ -255,10 +272,9 @@ class ZttpH2Protocol(asyncio.Protocol):
         self.tasks.add(task)
 
     def handle_rst_stream(self, event: zttp.RstStream) -> None:
+        self._draining.discard(event.stream_id)
         cycle = self.cycles.pop(event.stream_id, None)
-        if cycle is None:
-            return
-        if not cycle.response_complete:
+        if cycle is not None and not cycle.response_complete:
             cycle.disconnected = True
             cycle.message_event.set()
         self.on_stream_closed()
@@ -287,7 +303,7 @@ class ZttpH2Protocol(asyncio.Protocol):
 
         self._unset_keepalive_if_required()
 
-        if not self.cycles:
+        if not self.cycles and not self._draining:
             if self.shutdown_requested:
                 self._close_connection()
                 return
@@ -295,12 +311,54 @@ class ZttpH2Protocol(asyncio.Protocol):
                 self.timeout_keep_alive, self.timeout_keep_alive_handler
             )
 
+    def _stream_drained(self, stream_id: int) -> None:
+        """The request body of a stream held for drain_then_close finished."""
+        self._draining.discard(stream_id)
+        self.on_stream_closed()
+
+    def _log_protocol_error_access(self) -> None:
+        effective = self.policy_stack.current()
+        if protocol_error_access_enabled(effective, self.access_log):
+            client = "%s:%d" % self.client if self.client else ""
+            self.access_logger.info('%s - "<invalid HTTP/2 frame>" 400', client)
+
+    def _request_frame_close(self, mode: ConnHalfClose, stream_id: int) -> None:
+        """conn_half_close hook fired when a stream response finished.
+
+        GOAWAY is sent immediately so peers stop opening streams, but the
+        transport waits for every in-flight response iteration to finish (and,
+        for ``drain_then_close``, for this stream's upload to finish) before
+        closing. A force_close therefore never tears down an unfinished
+        response iterator ahead of the lifespan shutdown.
+        """
+        if self.transport.is_closing():
+            return
+        self.shutdown_requested = True
+        self._begin_goaway()
+        if mode == "drain_then_close":
+            cycle = self.cycles.get(stream_id)
+            if cycle is not None and cycle.more_body:
+                self._draining.add(stream_id)
+        self.resume_reading_if_idle()
+        if not self.cycles and not self._draining:
+            self._close_connection()
+
+    def _begin_goaway(self) -> None:
+        """Queue GOAWAY once (idempotent) without dropping the transport."""
+        if self._goaway_sent:
+            return
+        self._goaway_sent = True
+        try:
+            self.conn.close()
+        except Exception:  # pragma: no cover - zttp state edge cases
+            pass
+        self.flush()
+
     def _close_connection(self) -> None:
         """Send GOAWAY and close the transport."""
         if self.transport.is_closing():
             return
-        self.conn.close()
-        self.flush()
+        self._begin_goaway()
         self.transport.close()
 
     def shutdown(self) -> None:
@@ -311,7 +369,7 @@ class ZttpH2Protocol(asyncio.Protocol):
         503 and the connection closes once the last in-flight stream finishes.
         """
         self.shutdown_requested = True
-        if not self.cycles:
+        if not self.cycles and not self._draining:
             self._close_connection()
 
     def pause_writing(self) -> None:
@@ -349,6 +407,8 @@ class RequestResponseCycle:
         message_event: asyncio.Event,
         on_response: Callable[[int], None],
         resume_reading: Callable[[], None],
+        policy: PolicySnapshot,
+        on_frame_close: Callable[[ConnHalfClose, int], None],
     ) -> None:
         self.scope = scope
         self.conn = conn
@@ -362,6 +422,10 @@ class RequestResponseCycle:
         self.message_event = message_event
         self.on_response = on_response
         self.resume_reading = resume_reading
+        # Frozen for this stream frame; later pushes/pops never leak in.
+        self.policy = policy
+        self.on_frame_close = on_frame_close
+        self._frame_close_requested = False
 
         # Connection state
         self.disconnected = False
@@ -382,29 +446,38 @@ class RequestResponseCycle:
     # ASGI exception wrapper
     async def run_asgi(self, app: ASGI3Application) -> None:
         try:
-            result = await app(  # type: ignore[func-returns-value]
-                self.scope, self.receive, self.send
-            )
-        except BaseException as exc:
-            msg = "Exception in ASGI application\n"
-            self.logger.error(msg, exc_info=exc)
-            if not self.response_started:
-                await self.send_500_response()
+            try:
+                result = await app(  # type: ignore[func-returns-value]
+                    self.scope, self.receive, self.send
+                )
+            except BaseException as exc:
+                msg = "Exception in ASGI application\n"
+                self.logger.error(msg, exc_info=exc)
+                if not self.response_started:
+                    await self.send_500_response()
+                else:
+                    # Headers are already out: this stream cannot carry a
+                    # clean status, so it is an unrecoverable frame fault.
+                    self.policy.notify_uncaught()
+                    self.abort_stream()
             else:
-                self.abort_stream()
-        else:
-            if result is not None:
-                msg = "ASGI callable should return None, but returned '%s'."
-                self.logger.error(msg, result)
-                self.abort_stream()
-            elif not self.response_started and not self.disconnected:
-                msg = "ASGI callable returned without starting response."
-                self.logger.error(msg)
-                await self.send_500_response()
-            elif not self.response_complete and not self.disconnected:
-                msg = "ASGI callable returned without completing response."
-                self.logger.error(msg)
-                self.abort_stream()
+                if result is not None:
+                    msg = "ASGI callable should return None, but returned '%s'."
+                    self.logger.error(msg, result)
+                    self.abort_stream()
+                elif not self.response_started and not self.disconnected:
+                    msg = "ASGI callable returned without starting response."
+                    self.logger.error(msg)
+                    await self.send_500_response()
+                elif not self.response_complete and not self.disconnected:
+                    msg = "ASGI callable returned without completing response."
+                    self.logger.error(msg)
+                    self.abort_stream()
+        except BaseException as exc:
+            # The recovery path itself (e.g. building the 500) failed.
+            self.logger.error("Exception while recovering from ASGI application error", exc_info=exc)
+            self.policy.notify_uncaught()
+            self.abort_stream()
         finally:
             self.on_response(self.stream.stream_id)
             self.on_response = lambda stream_id: None
@@ -472,7 +545,7 @@ class RequestResponseCycle:
             if self.bodyless:
                 self.expected_content_length = None
 
-            if self.access_log:
+            if access_enabled(self.policy.effective(), status, self.access_log):
                 self.access_logger.info(
                     '%s - "%s %s HTTP/%s" %d',
                     get_client_addr(self.scope),
@@ -541,6 +614,10 @@ class RequestResponseCycle:
         if self.response_complete:
             self.message_event.set()
             self.transport.write(self.conn.data_to_send())
+            half_close = self.policy.effective().conn_half_close
+            if half_close in ("force_close", "drain_then_close") and not self._frame_close_requested:
+                self._frame_close_requested = True
+                self.on_frame_close(half_close, self.stream.stream_id)
             self.on_response(self.stream.stream_id)
             self.on_response = lambda stream_id: None
 

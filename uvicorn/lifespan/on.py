@@ -15,6 +15,7 @@ from uvicorn._types import (
     LifespanStartupEvent,
     LifespanStartupFailedEvent,
 )
+from uvicorn.policy import DEFAULT_BASELINE, EffectivePolicy, PolicyStack
 
 LifespanReceiveMessage = LifespanStartupEvent | LifespanShutdownEvent
 LifespanSendMessage = (
@@ -44,6 +45,20 @@ class LifespanOn:
         self.should_exit = False
         self.state: dict[str, Any] = {}
 
+        # Per-Server run-policy stack; ``None`` when driven directly (tests),
+        # in which case the baseline reproduces the historical behaviour.
+        self._policy_stack: PolicyStack | None = None
+
+    def bind_policy_stack(self, policy_stack: PolicyStack) -> None:
+        """Attach the Server run-policy stack. Called by ``Server``."""
+
+        self._policy_stack = policy_stack
+
+    def _effective_policy(self) -> EffectivePolicy:
+        if self._policy_stack is None:
+            return DEFAULT_BASELINE
+        return self._policy_stack.current()
+
     async def startup(self) -> None:
         self.logger.info("Waiting for application startup.")
 
@@ -56,8 +71,15 @@ class LifespanOn:
         await self.startup_event.wait()
 
         if self.startup_failed or (self.error_occurred and self.config.lifespan == "on"):
-            self.logger.error("Application startup failed. Exiting.")
-            self.should_exit = True
+            if self._effective_policy().lifespan_fault == "suppress_startup":
+                # Only log the failure and keep serving. ``Config.lifespan``
+                # is intentionally never rewritten.
+                self.logger.error(
+                    "Application startup failed; continuing into the main loop (lifespan_fault=suppress_startup)."
+                )
+            else:
+                self.logger.error("Application startup failed. Exiting.")
+                self.should_exit = True
         else:
             self.logger.info("Application startup complete.")
 

@@ -22,6 +22,7 @@ from uvicorn._types import (
 )
 from uvicorn.config import Config
 from uvicorn.logging import TRACE_LOG_LEVEL
+from uvicorn.policy import PolicySnapshot, access_enabled, protocol_error_access_enabled
 from uvicorn.protocols.http.flow_control import CLOSE_HEADER, HIGH_WATER_LIMIT, FlowControl, service_unavailable
 from uvicorn.protocols.utils import get_client_addr, get_local_addr, get_path_with_query_string, get_remote_addr, is_ssl
 from uvicorn.server import ServerState
@@ -74,6 +75,7 @@ class H11Protocol(asyncio.Protocol):
         self.server_state = server_state
         self.connections = server_state.connections
         self.tasks = server_state.tasks
+        self.policy_stack = server_state.policy_stack
 
         # Per-connection state
         self.transport: asyncio.Transport = None  # type: ignore[assignment]
@@ -181,6 +183,7 @@ class H11Protocol(asyncio.Protocol):
             except h11.RemoteProtocolError:
                 msg = "Invalid HTTP request received."
                 self.logger.warning(msg)
+                self._log_protocol_error_access()
                 self.send_400_response(msg)
                 return
 
@@ -244,6 +247,7 @@ class H11Protocol(asyncio.Protocol):
                     default_headers=self.server_state.default_headers,
                     message_event=asyncio.Event(),
                     on_response=self.on_response_complete,
+                    policy=self.policy_stack.snapshot(),
                 )
                 if self.config.reset_contextvars:
                     # Opt-in workaround for https://github.com/python/cpython/issues/140947:
@@ -264,7 +268,8 @@ class H11Protocol(asyncio.Protocol):
                 self.cycle.message_event.set()
 
             elif isinstance(event, h11.EndOfMessage):
-                if self.conn.our_state is h11.DONE:
+                draining = self.cycle is not None and self.cycle.drain_before_close
+                if self.conn.our_state is h11.DONE and not draining:
                     self.transport.resume_reading()
                     self.conn.start_next_cycle()
                     continue
@@ -292,6 +297,12 @@ class H11Protocol(asyncio.Protocol):
         self.transport.set_protocol(protocol)
         protocol.data_received(b"".join(output))
 
+    def _log_protocol_error_access(self) -> None:
+        effective = self.policy_stack.current()
+        if protocol_error_access_enabled(effective, self.access_log):
+            client = "%s:%d" % self.client if self.client else ""
+            self.access_logger.info('%s - "<invalid request>" 400', client)
+
     def send_400_response(self, msg: str) -> None:
         reason = STATUS_PHRASES[400]
         headers: list[tuple[bytes, bytes]] = [
@@ -318,6 +329,16 @@ class H11Protocol(asyncio.Protocol):
 
         # Set a short Keep-Alive timeout.
         self._unset_keepalive_if_required()
+
+        # conn_half_close=drain_then_close: keep the read side open just long
+        # enough to discard the unread request body, then close. No keep-alive
+        # timer is armed and no next request cycle is started.
+        if self.cycle is not None and self.cycle.drain_before_close:
+            self.flow.resume_reading()
+            task = self.loop.create_task(self.cycle.drain_request_then_close())
+            task.add_done_callback(self.tasks.discard)
+            self.tasks.add(task)
+            return
 
         self.timeout_keep_alive_task = self.loop.call_later(self.timeout_keep_alive, self.timeout_keep_alive_handler)
 
@@ -376,6 +397,7 @@ class RequestResponseCycle:
         default_headers: list[tuple[bytes, bytes]],
         message_event: asyncio.Event,
         on_response: Callable[..., None],
+        policy: PolicySnapshot,
     ) -> None:
         self.scope = scope
         self.conn = conn
@@ -387,6 +409,8 @@ class RequestResponseCycle:
         self.default_headers = default_headers
         self.message_event = message_event
         self.on_response = on_response
+        # Frozen for this request frame; later pushes/pops never leak in.
+        self.policy = policy
 
         # Connection state
         self.disconnected = False
@@ -401,31 +425,64 @@ class RequestResponseCycle:
         self.response_started = False
         self.response_complete = False
 
+        # Set when conn_half_close=drain_then_close must drain the request
+        # body before the connection is closed.
+        self.drain_before_close = False
+
+    def _maybe_request_fast_shutdown(self) -> None:
+        self.policy.notify_uncaught()
+
+    async def drain_request_then_close(self) -> None:
+        """Discard the rest of the request body, then close the connection."""
+        try:
+            while self.more_body and not self.disconnected:
+                self.flow.resume_reading()
+                await self.message_event.wait()
+                self.message_event.clear()
+                self.body = bytearray()
+        finally:
+            if not self.disconnected and not self.transport.is_closing():
+                try:
+                    self.conn.send(event=h11.ConnectionClosed())
+                except h11.LocalProtocolError:
+                    pass
+                self.transport.close()
+
     # ASGI exception wrapper
     async def run_asgi(self, app: ASGI3Application) -> None:
         try:
-            result = await app(  # type: ignore[func-returns-value]
-                self.scope, self.receive, self.send
-            )
-        except BaseException as exc:
-            msg = "Exception in ASGI application\n"
-            self.logger.error(msg, exc_info=exc)
-            if not self.response_started:
-                await self.send_500_response()
+            try:
+                result = await app(  # type: ignore[func-returns-value]
+                    self.scope, self.receive, self.send
+                )
+            except BaseException as exc:
+                msg = "Exception in ASGI application\n"
+                self.logger.error(msg, exc_info=exc)
+                if not self.response_started:
+                    await self.send_500_response()
+                else:
+                    # The response headers are already out, so no clean status
+                    # can be delivered: this is an unrecoverable frame fault.
+                    self._maybe_request_fast_shutdown()
+                    self.transport.close()
             else:
-                self.transport.close()
-        else:
-            if result is not None:
-                msg = "ASGI callable should return None, but returned '%s'."
-                self.logger.error(msg, result)
-                self.transport.close()
-            elif not self.response_started and not self.disconnected:
-                msg = "ASGI callable returned without starting response."
-                self.logger.error(msg)
-                await self.send_500_response()
-            elif not self.response_complete and not self.disconnected:
-                msg = "ASGI callable returned without completing response."
-                self.logger.error(msg)
+                if result is not None:
+                    msg = "ASGI callable should return None, but returned '%s'."
+                    self.logger.error(msg, result)
+                    self.transport.close()
+                elif not self.response_started and not self.disconnected:
+                    msg = "ASGI callable returned without starting response."
+                    self.logger.error(msg)
+                    await self.send_500_response()
+                elif not self.response_complete and not self.disconnected:
+                    msg = "ASGI callable returned without completing response."
+                    self.logger.error(msg)
+                    self.transport.close()
+        except BaseException as exc:
+            # The recovery path itself (e.g. building the 500) failed.
+            self.logger.error("Exception while recovering from ASGI application error", exc_info=exc)
+            self._maybe_request_fast_shutdown()
+            if not self.transport.is_closing():
                 self.transport.close()
         finally:
             self.on_response = lambda: None
@@ -469,7 +526,7 @@ class RequestResponseCycle:
             if CLOSE_HEADER in self.scope["headers"] and CLOSE_HEADER not in headers:
                 headers = headers + [CLOSE_HEADER]
 
-            if self.access_log:
+            if access_enabled(self.policy.effective(), status, self.access_log):
                 self.access_logger.info(
                     '%s - "%s %s HTTP/%s" %d',
                     get_client_addr(self.scope),
@@ -510,7 +567,16 @@ class RequestResponseCycle:
             raise RuntimeError(f"Unexpected ASGI message '{message['type']}' sent, after response already completed.")
 
         if self.response_complete:
-            if self.conn.our_state is h11.MUST_CLOSE or not self.keep_alive:
+            half_close = self.policy.effective().conn_half_close
+            must_close_now = self.conn.our_state is h11.MUST_CLOSE or not self.keep_alive or half_close == "force_close"
+            if half_close == "drain_then_close" and not must_close_now and self.more_body:
+                # The response is already fully written; keep the connection
+                # open just long enough to drain the unread request body.
+                self.keep_alive = False
+                self.drain_before_close = True
+            elif must_close_now or half_close == "drain_then_close":
+                # force_close reaches here immediately (the frame response is
+                # finished, so no in-flight response iterator is torn down).
                 self.conn.send(event=h11.ConnectionClosed())
                 self.transport.close()
             self.on_response()

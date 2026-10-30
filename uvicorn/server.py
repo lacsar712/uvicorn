@@ -12,7 +12,7 @@ import socket
 import sys
 import threading
 import time
-from collections.abc import Generator, Sequence
+from collections.abc import Generator, Iterator, Sequence
 from email.utils import formatdate
 from types import FrameType
 from typing import TYPE_CHECKING, TypeAlias
@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING, TypeAlias
 from uvicorn._ansi import style
 from uvicorn._compat import asyncio_run
 from uvicorn.config import STARTUP_FAILURE, Config
+from uvicorn.policy import AccessEmit, ConnHalfClose, LifespanFault, PolicySnapshot, PolicyStack
 
 if TYPE_CHECKING:
     from uvicorn.protocols.http.auto_zttp_impl import AutoZttpProtocol
@@ -62,6 +63,10 @@ class ServerState:
         self.connections: set[Protocols] = set()
         self.tasks: set[asyncio.Task[None]] = set()
         self.default_headers: list[tuple[bytes, bytes]] = []
+        # Per-Server run-policy stack. Never a process singleton: every Server
+        # (and therefore every worker / embedded driver) owns an independent
+        # stack, so they cannot interfere with one another.
+        self.policy_stack = PolicyStack()
 
 
 class Server:
@@ -85,6 +90,39 @@ class Server:
     def run(self, sockets: list[socket.socket] | None = None) -> None:
         return asyncio_run(self.serve(sockets=sockets), loop_factory=self.config.get_loop_factory())
 
+    @contextlib.contextmanager
+    def policy_scope(
+        self,
+        *,
+        lifespan_fault: LifespanFault | None = None,
+        access_emit: AccessEmit | None = None,
+        conn_half_close: ConnHalfClose | None = None,
+    ) -> Iterator[PolicySnapshot]:
+        """Run a segment of this Server under a temporary run-policy layer.
+
+        The layer is bound to this Server's stack (lifespan and connection
+        frames resolve against it) and is popped automatically on exit,
+        including on the exception path. Use ``async with`` or ``with``.
+        """
+
+        with self.server_state.policy_stack.scope(
+            lifespan_fault=lifespan_fault,
+            access_emit=access_emit,
+            conn_half_close=conn_half_close,
+        ) as snapshot:
+            yield snapshot
+
+    def _request_fast_shutdown(self) -> None:
+        """Trigger a graceful shutdown from ``fail_fast_shutdown``.
+
+        Only ``should_exit`` is raised, so ``main_loop`` winds down and
+        ``shutdown()`` still runs the lifespan shutdown callbacks. This must
+        never set ``force_exit`` (which would skip those callbacks) and must
+        never tear down a response iterator that has not finished.
+        """
+
+        self.should_exit = True
+
     async def serve(self, sockets: list[socket.socket] | None = None) -> None:
         with self.capture_signals():
             await self._serve(sockets)
@@ -96,7 +134,15 @@ class Server:
         if not config.loaded:
             config.load()
 
+        # Merge the run-policy baseline with the loaded Config and let
+        # connection frames ask for a lifespan-preserving shutdown.
+        self.server_state.policy_stack.bind_config(config)
+        self.server_state.policy_stack.request_shutdown = self._request_fast_shutdown
+
         self.lifespan = config.lifespan_class(config)
+        bind_policy_stack = getattr(self.lifespan, "bind_policy_stack", None)
+        if callable(bind_policy_stack):
+            bind_policy_stack(self.server_state.policy_stack)
 
         message = "Started server process [%d]"
         color_message = "Started server process [" + style("%d", fg="cyan") + "]"
